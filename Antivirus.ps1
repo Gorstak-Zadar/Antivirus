@@ -3157,6 +3157,97 @@ function Invoke-RegistryPersistenceDetection {
     return $detections.Count
 }
 
+#region DLL Hijacking - UAC Bypass Vectors (from DLLHijackingDetection.ps1)
+function Get-COMAutoElevationVectors {
+    # Scans HKLM\SOFTWARE\Classes\CLSID for COM objects with Elevation\Enabled=1 (DLLHijackHunter-style)
+    $detections = @()
+    $clsidPaths = @(
+        "HKLM:\SOFTWARE\Classes\CLSID\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Classes\CLSID\*"
+    )
+    foreach ($path in $clsidPaths) {
+        try {
+            $clsidKeys = Get-ChildItem -Path $path -ErrorAction SilentlyContinue
+            foreach ($key in $clsidKeys) {
+                try {
+                    $elevationPath = "$($key.PSPath)\Elevation"
+                    $elevationKey = Get-ItemProperty -Path $elevationPath -ErrorAction SilentlyContinue
+                    if ($elevationKey -and $elevationKey.Enabled -eq 1) {
+                        $targetPath = $null; $targetType = $null
+                        $inprocPath = "$($key.PSPath)\InprocServer32"
+                        if (Test-Path $inprocPath) {
+                            $inproc = Get-ItemProperty -Path $inprocPath -ErrorAction SilentlyContinue
+                            if ($inproc -and $inproc.(default)) { $targetPath = $inproc.(default); $targetType = "InprocServer32 (DLL)" }
+                        }
+                        if (-not $targetPath) {
+                            $localPath = "$($key.PSPath)\LocalServer32"
+                            if (Test-Path $localPath) {
+                                $local = Get-ItemProperty -Path $localPath -ErrorAction SilentlyContinue
+                                if ($local -and $local.(default)) { $targetPath = $local.(default); $targetType = "LocalServer32 (EXE)" }
+                            }
+                        }
+                        if ($targetPath) {
+                            $targetPath = $targetPath -replace '%SystemRoot%', $env:SystemRoot -replace '%ProgramFiles%', $env:ProgramFiles -replace '^"|"$', ''
+                            $targetPath = ($targetPath -split '\s+')[0]
+                            $detections += @{
+                                Vector = "COM AutoElevation"; CLSID = Split-Path $key.PSPath -Leaf; TargetPath = $targetPath
+                                TargetType = $targetType; PrivilegeLevel = "High"; Risk = "High"; RegistryPath = $key.PSPath
+                            }
+                        }
+                    }
+                } catch { continue }
+            }
+        } catch { }
+    }
+    return $detections
+}
+
+function Get-ManifestAutoElevateBinaries {
+    # Scans System32/SysWOW64 for binaries with <autoElevate>true</autoElevate>
+    $detections = @()
+    $searchPaths = @("$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64")
+    $binaries = @()
+    foreach ($path in $searchPaths) {
+        if (Test-Path $path) { $binaries += Get-ChildItem -Path $path -Include "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 500 }
+    }
+    foreach ($bin in $binaries) {
+        try {
+            $manifestPath = "$($bin.FullName).manifest"
+            $content = $null
+            if (Test-Path $manifestPath) {
+                $content = Get-Content -Path $manifestPath -Raw -ErrorAction SilentlyContinue
+            } else {
+                $bytes = [System.IO.File]::ReadAllBytes($bin.FullName)
+                $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+                $unicode = [System.Text.Encoding]::Unicode.GetString($bytes)
+                if ($ascii -match 'autoElevate[\s>]*true' -or $unicode -match 'autoElevate[\s>]*true') { $content = "autoElevate present" }
+            }
+            if ($content -and ($content -match 'autoElevate[\s>]*true|autoElevate\s*>\s*true')) {
+                $vulnerableToCopyDrop = Test-CopyDropVulnerable -BinaryPath $bin.FullName
+                $detections += @{
+                    Vector = "Manifest AutoElevate"; BinaryPath = $bin.FullName; BinaryName = $bin.Name
+                    VulnerableToCopyDrop = $vulnerableToCopyDrop; PrivilegeLevel = "High"
+                    Risk = if ($vulnerableToCopyDrop) { "Critical" } else { "High" }
+                }
+            }
+        } catch { continue }
+    }
+    return $detections
+}
+
+function Test-CopyDropVulnerable {
+    # Binary lacks SetDllDirectory/SetDefaultDllDirectories = vulnerable to copy-to-%TEMP% side-load
+    param([string]$BinaryPath)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($BinaryPath)
+        $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+        $hasSetDllDirectory = $ascii -match 'SetDllDirectory'
+        $hasSetDefaultDllDirectories = $ascii -match 'SetDefaultDllDirectories'
+        return -not ($hasSetDllDirectory -or $hasSetDefaultDllDirectories)
+    } catch { return $false }
+}
+#endregion
+
 function Test-DLLHijacking {
     param([string]$DllPath)
     
@@ -3192,16 +3283,19 @@ function Invoke-DLLHijackingDetection {
     $detections = @()
     
     try {
-        # Check loaded DLLs in processes
-        $processes = Get-Process -ErrorAction SilentlyContinue
+        # UAC Bypass vectors (from DLLHijackingDetection.ps1 - COM AutoElevation, Manifest AutoElevate)
+        $detections += Get-COMAutoElevationVectors
+        $detections += Get-ManifestAutoElevateBinaries
         
+        # Standard detection: loaded DLLs in processes
+        $processes = Get-Process -ErrorAction SilentlyContinue
         foreach ($proc in $processes) {
             try {
                 $modules = $proc.Modules | Where-Object { $_.FileName -like "*.dll" }
-                
                 foreach ($module in $modules) {
                     if (Test-DLLHijacking -DllPath $module.FileName) {
                         $detections += @{
+                            Vector = "Loaded DLL"
                             ProcessId = $proc.Id
                             ProcessName = $proc.ProcessName
                             DllPath = $module.FileName
@@ -3211,10 +3305,7 @@ function Invoke-DLLHijackingDetection {
                         }
                     }
                 }
-            } catch {
-                # Access denied or process exited
-                continue
-            }
+            } catch { continue }
         }
         
         # Check for DLLs in application directories
@@ -3239,6 +3330,7 @@ function Invoke-DLLHijackingDetection {
                             $sig = Get-AuthenticodeSignature -FilePath $dll.FullName -ErrorAction SilentlyContinue
                             if ($sig.Status -ne "Valid") {
                                 $detections += @{
+                                    Vector = "Unsigned DLL in app dir"
                                     DllPath = $dll.FullName
                                     Type = "Unsigned DLL in application directory"
                                     Risk = "Medium"
@@ -3256,6 +3348,7 @@ function Invoke-DLLHijackingDetection {
             foreach ($event in $events) {
                 if ($event.Message -match 'DLL.*not.*found|DLL.*load.*failed') {
                     $detections += @{
+                        Vector = "DLL Load Failure"
                         EventId = $event.Id
                         Message = $event.Message
                         TimeCreated = $event.TimeCreated
@@ -3268,7 +3361,12 @@ function Invoke-DLLHijackingDetection {
         
         if ($detections.Count -gt 0) {
             foreach ($detection in $detections) {
-                Write-AVLog "DLL HIJACKING: $($detection.Type) - $($detection.ProcessName -or 'System') - $($detection.DllPath -or $detection.DllName -or $detection.Message)" "THREAT" "dll_hijacking_detections.log"
+                $msg = switch ($detection.Vector) {
+                    "COM AutoElevation" { "UAC BYPASS (COM): $($detection.CLSID) -> $($detection.TargetPath) [$($detection.PrivilegeLevel)]" }
+                    "Manifest AutoElevate" { "UAC BYPASS (Manifest): $($detection.BinaryPath)$(if ($detection.VulnerableToCopyDrop) { ' [COPY-DROP VULN]' } else { '' })" }
+                    default { "DLL HIJACKING: $($detection.Type) - $($detection.ProcessName -or 'System') - $($detection.DllPath -or $detection.DllName -or $detection.Message)" }
+                }
+                Write-AVLog $msg "THREAT" "dll_hijacking_detections.log"
                 $Global:AntivirusState.ThreatCount++
                 
                 if ($detection.ProcessId -and $Config.AutoKillThreats) {
@@ -3284,8 +3382,12 @@ function Invoke-DLLHijackingDetection {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
             }
             $detections | ForEach-Object {
-                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.ProcessName -or $_.Type)|$($_.DllPath -or $_.DllName)|$($_.Risk)" |
-                    Add-Content -Path $logPath -ErrorAction SilentlyContinue
+                $line = switch ($_.Vector) {
+                    "COM AutoElevation" { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Vector)|$($_.CLSID)|$($_.TargetPath)|$($_.PrivilegeLevel)|$($_.Risk)" }
+                    "Manifest AutoElevate" { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Vector)|$($_.BinaryPath)|CopyDrop=$($_.VulnerableToCopyDrop)|$($_.Risk)" }
+                    default { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.ProcessName -or $_.Type)|$($_.DllPath -or $_.DllName)|$($_.Risk)" }
+                }
+                Add-Content -Path $logPath -Value $line -ErrorAction SilentlyContinue
             }
         }
     } catch {
