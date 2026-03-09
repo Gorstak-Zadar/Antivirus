@@ -758,25 +758,44 @@ function Invoke-PasswordRotatorSetup {
     $flagFile = Join-Path $targetDir ".installed"
     if (Test-Path $flagFile) { return }
     $onLogonTask = "PasswordRotator-OnLogon"
+
+    # Embedded worker script (from Install-PasswordRotator.ps1 - runs as SYSTEM from ProgramData; handles Logon / Rotate / Logoff)
     $workerScript = @'
 param([string]$Mode, [string]$Username)
 $ErrorActionPreference = 'Stop'
 $TargetDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\ProgramData\PasswordRotator' }
 $UserFile = Join-Path $TargetDir 'currentuser.txt'
+
 function Get-LoggedInUser {
     $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue
     $user = $cs.UserName
-    if (-not $user) { return $null }; if ($user -match '\\') { return $user.Split('\')[-1] }; return $user
+    if (-not $user) { return $null }
+    if ($user -match '\\') { return $user.Split('\')[-1] }
+    return $user
 }
-function Set-UserPassword { param([string]$U, [string]$P)
+function Set-UserPassword {
+    param([string]$U, [string]$P)
     if ([string]::IsNullOrWhiteSpace($U)) { return }
-    try { Set-LocalUser -Name $U -Password (ConvertTo-SecureString -String $P -AsPlainText -Force) -ErrorAction Stop } catch {
-        try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$U,user"; $adsi.SetPassword($P) } catch { "$(Get-Date -Format o) Set-UserPassword: $_" | Out-File (Join-Path $TargetDir 'log.txt') -Append }
+    try {
+        Set-LocalUser -Name $U -Password (ConvertTo-SecureString -String $P -AsPlainText -Force) -ErrorAction Stop
+    } catch {
+        try {
+            [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$U,user"
+            $adsi.SetPassword($P)
+        } catch {
+            "$(Get-Date -Format o) Set-UserPassword: $_" | Out-File (Join-Path $TargetDir 'log.txt') -Append
+        }
     }
 }
-function Set-UserPasswordBlank { param([string]$N)
+function Set-UserPasswordBlank {
+    param([string]$N)
     if ([string]::IsNullOrWhiteSpace($N)) { return }
-    try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$N,user"; $adsi.SetPassword('') } catch { try { & net user $N '' } catch {} }
+    try {
+        [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$N,user"
+        $adsi.SetPassword('')
+    } catch {
+        try { & net user $N '' } catch { "$(Get-Date -Format o) Blank: $_" | Out-File (Join-Path $TargetDir 'log.txt') -Append }
+    }
 }
 function New-RandomPwd {
     $c = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'
@@ -786,12 +805,16 @@ function Remove-TasksForUser { param([string]$U)
     $s = $U -replace '[^a-zA-Z0-9]', '_'
     @("PasswordRotator-10Min-$s", "PasswordRotator-OnLogoff-$s") | ForEach-Object { Unregister-ScheduledTask -TaskName $_ -Confirm:$false -ErrorAction SilentlyContinue }
 }
+
 switch ($Mode) {
     'Logon' {
-        $u = Get-LoggedInUser; if (-not $u) { exit 0 }
+        $u = Get-LoggedInUser
+        if (-not $u) { exit 0 }
         if (-not (Test-Path $TargetDir)) { New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null }
-        $u | Set-Content -Path $UserFile -Force; Remove-TasksForUser -U $u
-        $safe = $u -replace '[^a-zA-Z0-9]', '_'; $worker = Join-Path $TargetDir 'Worker.ps1'
+        $u | Set-Content -Path $UserFile -Force
+        Remove-TasksForUser -U $u
+        $safe = $u -replace '[^a-zA-Z0-9]', '_'
+        $worker = Join-Path $TargetDir 'Worker.ps1'
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $trigger10 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)
         $action10 = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Rotate"
@@ -799,27 +822,33 @@ switch ($Mode) {
         $triggerOff = New-ScheduledTaskTrigger -AtLogOff -User $u
         $actionOff = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Logoff -Username $u"
         Register-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$safe" -Action $actionOff -Trigger $triggerOff -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable) -Force | Out-Null
-        Start-Sleep -Seconds 60; Set-UserPassword -U $u -P (New-RandomPwd)
+        Start-Sleep -Seconds 60
+        Set-UserPassword -U $u -P (New-RandomPwd)
     }
     'Rotate' {
-        if (-not (Test-Path $UserFile)) { exit 0 }; $u = (Get-Content -Path $UserFile -Raw).Trim()
+        if (-not (Test-Path $UserFile)) { exit 0 }
+        $u = (Get-Content -Path $UserFile -Raw).Trim()
         if ($u) { Set-UserPassword -U $u -P (New-RandomPwd) }
     }
     'Logoff' {
-        if ($Username) { Set-UserPasswordBlank -N $Username; $s = $Username -replace '[^a-zA-Z0-9]', '_'
+        if ($Username) {
+            Set-UserPasswordBlank -N $Username
+            $s = $Username -replace '[^a-zA-Z0-9]', '_'
             Unregister-ScheduledTask -TaskName "PasswordRotator-10Min-$s" -Confirm:$false -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$s" -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 }
 '@
+
     if (-not (Test-Path $targetDir)) { New-Item -Path $targetDir -ItemType Directory -Force | Out-Null }
     $workerScript | Set-Content -Path (Join-Path $targetDir 'Worker.ps1') -Encoding UTF8 -Force
     $workerPath = Join-Path $targetDir 'Worker.ps1'
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'Everyone'
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$workerPath`" -Mode Logon"
-    Register-ScheduledTask -TaskName $onLogonTask -Action $action -Trigger $trigger -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $onLogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     try {
         $currentUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
         if ($currentUser -match '\\') { $currentUser = $currentUser.Split('\')[-1] }
@@ -827,7 +856,7 @@ switch ($Mode) {
             [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$currentUser,user"
             $adsi.SetPassword('')
         }
-    } catch {}
+    } catch { }
     New-Item -Path $flagFile -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
     Write-Host "Password rotator installed (flagged). Current user password set to blank." -ForegroundColor Green
 }
