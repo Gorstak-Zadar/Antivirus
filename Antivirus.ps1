@@ -760,11 +760,13 @@ function Invoke-PasswordRotatorSetup {
     $onLogonTask = "PasswordRotator-OnLogon"
 
     # Embedded worker script (from Install-PasswordRotator.ps1 - runs as SYSTEM from ProgramData; handles Logon / Rotate / Logoff)
+    # Excluded accounts: never rotated - use for recovery (Admin can reset user passwords via net user / lusrmgr)
     $workerScript = @'
 param([string]$Mode, [string]$Username)
 $ErrorActionPreference = 'Stop'
 $TargetDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\ProgramData\PasswordRotator' }
 $UserFile = Join-Path $TargetDir 'currentuser.txt'
+$ExcludedAccounts = @('Admin','Administrator','Guest','DefaultAccount','WDAGUtilityAccount')  # recovery accounts - never rotate
 
 function Get-LoggedInUser {
     $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue
@@ -810,6 +812,7 @@ switch ($Mode) {
     'Logon' {
         $u = Get-LoggedInUser
         if (-not $u) { exit 0 }
+        if ($ExcludedAccounts -contains $u) { exit 0 }  # recovery accounts: skip rotation
         if (-not (Test-Path $TargetDir)) { New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null }
         $u | Set-Content -Path $UserFile -Force
         Remove-TasksForUser -U $u
@@ -828,10 +831,11 @@ switch ($Mode) {
     'Rotate' {
         if (-not (Test-Path $UserFile)) { exit 0 }
         $u = (Get-Content -Path $UserFile -Raw).Trim()
-        if ($u) { Set-UserPassword -U $u -P (New-RandomPwd) }
+        if (-not $u -or ($ExcludedAccounts -contains $u)) { exit 0 }
+        Set-UserPassword -U $u -P (New-RandomPwd)
     }
     'Logoff' {
-        if ($Username) {
+        if ($Username -and ($ExcludedAccounts -notcontains $Username)) {
             Set-UserPasswordBlank -N $Username
             $s = $Username -replace '[^a-zA-Z0-9]', '_'
             Unregister-ScheduledTask -TaskName "PasswordRotator-10Min-$s" -Confirm:$false -ErrorAction SilentlyContinue
@@ -849,10 +853,11 @@ switch ($Mode) {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$workerPath`" -Mode Logon"
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
     Register-ScheduledTask -TaskName $onLogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    $recoveryAccounts = @('Admin','Administrator','Guest','DefaultAccount','WDAGUtilityAccount')
     try {
         $currentUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
         if ($currentUser -match '\\') { $currentUser = $currentUser.Split('\')[-1] }
-        if ($currentUser) {
+        if ($currentUser -and ($recoveryAccounts -notcontains $currentUser)) {
             [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$currentUser,user"
             $adsi.SetPassword('')
         }
