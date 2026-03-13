@@ -10,9 +10,10 @@ param(
 # ============================================================================
 # Antivirus.ps1 - Single-file EDR/Antivirus (Merged)
 # Author: Gorstak
-# Version: 2.0.0
+# Version: 2.10.0
 #
 # Changelog:
+#   v2.10.0 - GEDR compatibility: add GEDR/Antivirus to protected processes, C:\ProgramData\GEDR to exclusions
 #   v2.0.0 - Merged AV1+AV2; Grok improvements (hash DB, low-power, opt-in modules)
 #   v2.1.0 - DeepSeek improvements (circuit breakers, cache cleanup, LearningMode)
 #   v2.2.0 - Claude improvements (hash DB locking, FSW debounce, Invoke-Response)
@@ -146,7 +147,8 @@ $Config = @{
         "$Script:InstallPath\Logs",
         "$Script:InstallPath\Quarantine",
         "$Script:InstallPath\Reports",
-        "$Script:InstallPath\Data"
+        "$Script:InstallPath\Data",
+        "C:\ProgramData\GEDR"
     )
     ExclusionProcesses = @("powershell", "pwsh")
 
@@ -1803,7 +1805,9 @@ function Stop-ThreatProcess {
         # Browsers (multi-process architecture)
         'chrome', 'firefox', 'msedge', 'brave', 'opera',
         # Common utilities
-        'powershell', 'pwsh', 'WindowsTerminal', 'cmd'
+        'powershell', 'pwsh', 'WindowsTerminal', 'cmd',
+        # EDR (never kill GEDR - prevents feedback loop with assembly/NI quarantine)
+        'gedr', 'GEDR', 'Antivirus'
     )
     
     # Check if process name matches protected list (case-insensitive)
@@ -6835,7 +6839,7 @@ function Invoke-PhantomProcessKiller {
     try {
         $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
         $runningPids = $processes | Select-Object -ExpandProperty ProcessId
-        $protected = @('System', 'Idle', 'smss', 'csrss', 'wininit', 'services', 'lsass', 'svchost', 'winlogon', 'explorer', 'dwm', 'powershell', 'pwsh', 'Code', 'Cursor')
+        $protected = @('System', 'Idle', 'smss', 'csrss', 'wininit', 'services', 'lsass', 'svchost', 'winlogon', 'explorer', 'dwm', 'powershell', 'pwsh', 'Code', 'Cursor', 'gedr', 'GEDR', 'Antivirus')
         foreach ($proc in $processes) {
             if ($proc.ProcessId -eq $PID -or $proc.ProcessId -eq $Script:SelfPID) { continue }
             $procName = $proc.Name -replace '\.exe$', ''
