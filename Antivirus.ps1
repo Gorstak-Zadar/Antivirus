@@ -10,7 +10,7 @@ param(
 # ============================================================================
 # Antivirus.ps1 - Single-file EDR/Antivirus (Merged)
 # Author: Gorstak
-# Version: 2.11.0
+# Version: 2.12.0
 #
 # Changelog:
 #   v2.11.0 - HeadersCheck: Zombie ZIP (CVE-2026-0866) detection, scans all file headers in suspicious paths
@@ -9347,6 +9347,7 @@ function Invoke-HeadersCheck {
                 } | Select-Object -First ($maxFiles - $scanned)
                 foreach ($f in $files) {
                     $scanned++
+                    $rule = $null
                     if (Test-TinyShouldExclude -FilePath $f.FullName) { continue }
                     $buf = $null
                     try {
@@ -9393,6 +9394,43 @@ function Invoke-HeadersCheck {
                             break
                         }
                         $pos = $dataStart + $compSize - 1
+                    }
+                    if ($rule) { continue }
+                    $docImageExts = @('.pdf','.jpg','.jpeg','.png','.gif','.bmp','.txt','.doc','.docx','.rtf','.odt','.xls','.xlsx')
+                    $ext = [IO.Path]::GetExtension($f.FullName).ToLower()
+                    if ($docImageExts -contains $ext -and $buf.Length -ge 2 -and $buf[0] -eq 0x4D -and $buf[1] -eq 0x5A) {
+                        $rule = "ExtensionMagicMismatch"
+                        Write-AVLog "HeadersCheck: PE disguised as doc/image: $($f.FullName)" "THREAT" "headers_check.log"
+                        if (-not $Script:LearningMode -and $Config.AutoQuarantine) {
+                            try {
+                                Move-ToQuarantine -Path $f.FullName -Reason "ExtensionMagicMismatch (PE as doc/image)"
+                                $detections += @{ FilePath = $f.FullName; Rule = $rule }
+                                $Global:AntivirusState.ThreatCount++
+                            } catch { }
+                        } else { $detections += @{ FilePath = $f.FullName; Rule = $rule } }
+                        continue
+                    }
+                    $polyglotScan = [Math]::Min(1024, $buf.Length - 2)
+                    $startsAsDoc = ($buf.Length -ge 4 -and $buf[0] -eq 0x25 -and $buf[1] -eq 0x50 -and $buf[2] -eq 0x44 -and $buf[3] -eq 0x46) -or
+                        ($buf.Length -ge 8 -and $buf[0] -eq 0x89 -and $buf[1] -eq 0x50 -and $buf[2] -eq 0x4E -and $buf[3] -eq 0x47) -or
+                        ($buf.Length -ge 4 -and $buf[0] -eq 0x47 -and $buf[1] -eq 0x49 -and $buf[2] -eq 0x46 -and $buf[3] -in 0x38,0x39) -or
+                        ($buf.Length -ge 3 -and $buf[0] -eq 0xFF -and $buf[1] -eq 0xD8 -and $buf[2] -eq 0xFF) -or
+                        ($buf.Length -ge 2 -and $buf[0] -eq 0x42 -and $buf[1] -eq 0x4D)
+                    if ($startsAsDoc) {
+                        for ($i = 2; $i -le $polyglotScan - 2; $i++) {
+                            if ($buf[$i] -eq 0x4D -and $buf[$i+1] -eq 0x5A) {
+                                $rule = "PolyglotPeEmbedded"
+                                Write-AVLog "HeadersCheck: Polyglot PE embedded in doc/image: $($f.FullName)" "THREAT" "headers_check.log"
+                                if (-not $Script:LearningMode -and $Config.AutoQuarantine) {
+                                    try {
+                                        Move-ToQuarantine -Path $f.FullName -Reason "PolyglotPeEmbedded"
+                                        $detections += @{ FilePath = $f.FullName; Rule = $rule }
+                                        $Global:AntivirusState.ThreatCount++
+                                    } catch { }
+                                } else { $detections += @{ FilePath = $f.FullName; Rule = $rule } }
+                                break
+                            }
+                        }
                     }
                 }
             } catch { }
