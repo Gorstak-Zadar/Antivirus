@@ -10,9 +10,10 @@ param(
 # ============================================================================
 # Antivirus.ps1 - Single-file EDR/Antivirus (Merged)
 # Author: Gorstak
-# Version: 2.10.0
+# Version: 2.11.0
 #
 # Changelog:
+#   v2.11.0 - HeadersCheck: Zombie ZIP (CVE-2026-0866) detection, scans all file headers in suspicious paths
 #   v2.10.0 - GEDR compatibility: add GEDR/Antivirus to protected processes, C:\ProgramData\GEDR to exclusions
 #   v2.0.0 - Merged AV1+AV2; Grok improvements (hash DB, low-power, opt-in modules)
 #   v2.1.0 - DeepSeek improvements (circuit breakers, cache cleanup, LearningMode)
@@ -91,6 +92,7 @@ $Script:ManagedJobConfig = @{
     CodeInjectionDetectionIntervalSeconds = 30
     DataExfiltrationDetectionIntervalSeconds = 30
     FileEntropyDetectionIntervalSeconds = 120
+    HeadersCheckIntervalSeconds = 180
     HoneypotMonitoringIntervalSeconds = 30
     LateralMovementDetectionIntervalSeconds = 30
     ProcessCreationDetectionIntervalSeconds = 10
@@ -9324,6 +9326,83 @@ function Invoke-FileEntropyDetection {
     return $detections.Count
 }
 
+function Invoke-HeadersCheck {
+    $detections = @()
+    $maxFiles = 2000
+    $maxFileSize = 20MB
+    $headerReadBytes = 128KB
+    $zipLocalSig = [byte[]]@(0x50, 0x4b, 0x03, 0x04)
+    $entropyThreshold = 7.2
+    $scanPaths = @("$env:TEMP", "$env:APPDATA", "$env:LOCALAPPDATA", "$env:LOCALAPPDATA\Temp", "$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop")
+    foreach ($exclusion in $Config.ExclusionPaths) {
+        $scanPaths = $scanPaths | Where-Object { $_ -notlike "*$exclusion*" }
+    }
+    try {
+        $scanned = 0
+        foreach ($scanPath in $scanPaths) {
+            if (-not (Test-Path $scanPath) -or $scanned -ge $maxFiles) { break }
+            try {
+                $files = Get-ChildItem -Path $scanPath -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Length -ge 50 -and $_.Length -le $maxFileSize
+                } | Select-Object -First ($maxFiles - $scanned)
+                foreach ($f in $files) {
+                    $scanned++
+                    if (Test-TinyShouldExclude -FilePath $f.FullName) { continue }
+                    $buf = $null
+                    try {
+                        $toRead = [Math]::Min($headerReadBytes, $f.Length)
+                        $stream = [System.IO.File]::OpenRead($f.FullName)
+                        $buf = New-Object byte[] $toRead
+                        $r = $stream.Read($buf, 0, $toRead)
+                        $stream.Close()
+                        if ($r -lt 50) { continue }
+                    } catch { continue }
+                    for ($pos = 0; $pos -le $buf.Length - 30; $pos++) {
+                        if ($buf[$pos] -ne 0x50 -or $buf[$pos+1] -ne 0x4b -or $buf[$pos+2] -ne 0x03 -or $buf[$pos+3] -ne 0x04) { continue }
+                        $compMethod = [BitConverter]::ToUInt16($buf, $pos + 8)
+                        $compSize = [BitConverter]::ToInt32($buf, $pos + 18)
+                        $fnLen = [BitConverter]::ToUInt16($buf, $pos + 26)
+                        $efLen = [BitConverter]::ToUInt16($buf, $pos + 28)
+                        $dataStart = $pos + 30 + $fnLen + $efLen
+                        if ($compMethod -ne 0 -or $compSize -lt 64 -or $compSize -gt $maxFileSize) { $pos += 3; continue }
+                        if ($dataStart + 256 -gt $buf.Length) { break }
+                        $sampleLen = [Math]::Min([Math]::Min($compSize, 4096), $buf.Length - $dataStart)
+                        if ($sampleLen -lt 256) { $pos += 3; continue }
+                        $freq = @{}
+                        for ($i = 0; $i -lt $sampleLen; $i++) {
+                            $b = $buf[$dataStart + $i]
+                            if ($freq.ContainsKey($b)) { $freq[$b]++ } else { $freq[$b] = 1 }
+                        }
+                        $ent = 0
+                        foreach ($c in $freq.Values) {
+                            $p = $c / $sampleLen
+                            if ($p -gt 0) { $ent -= $p * [Math]::Log($p, 2) }
+                        }
+                        if ($ent -ge $entropyThreshold) {
+                            $rule = "ZombieZip"
+                            Write-AVLog "HeadersCheck: Zombie ZIP (CVE-2026-0866) detected: $($f.FullName)" "THREAT" "headers_check.log"
+                            if (-not $Script:LearningMode -and $Config.AutoQuarantine) {
+                                try {
+                                    Move-ToQuarantine -Path $f.FullName -Reason "ZombieZip (CVE-2026-0866)"
+                                    $detections += @{ FilePath = $f.FullName; Rule = $rule }
+                                    $Global:AntivirusState.ThreatCount++
+                                } catch { }
+                            } else {
+                                $detections += @{ FilePath = $f.FullName; Rule = $rule }
+                            }
+                            break
+                        }
+                        $pos = $dataStart + $compSize - 1
+                    }
+                }
+            } catch { }
+        }
+    } catch {
+        Write-AVLog "HeadersCheck error: $_" "ERROR" "headers_check.log"
+    }
+    return $detections.Count
+}
+
 function Invoke-HoneypotMonitoring {
     $detections = @()
     
@@ -12742,6 +12821,7 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "CodeInjectionDetection",
         "DataExfiltrationDetection",
         "FileEntropyDetection",
+        "HeadersCheck",
         "HoneypotMonitoring",
         "LateralMovementDetection",
         "ProcessCreationDetection",
