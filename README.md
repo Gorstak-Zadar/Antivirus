@@ -525,6 +525,15 @@ ProcessCreationDetectionIntervalSeconds = 30  # Was 10
 
 ---
 
+## 🔗 Companion Tools
+
+| Tool | Description |
+|------|--------------|
+| **[SysmonFull](../SysmonFull)** | Sysmon-style event logging to Windows Event Log (no MSFT skips). Run alongside for full audit; GEDR consumes via JobSysmonLogIngestion. |
+| **[AutorunsEnhanced](../AutorunsEnhanced)** | Autoruns + auto-remove unverified entries + untrusted font check. `-RemoveUnverified` to remediate. |
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Here's how:
